@@ -7,11 +7,18 @@ import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache_pool
+from minisgl.kvcache import LinearStatePool, create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
-from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
+from minisgl.utils import (
+    div_even,
+    init_logger,
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -51,9 +58,47 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
-        # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        # ======================= KV cache / linear state initialization ========================
+        min_post_model_free, max_post_model_free = self._sync_get_memory()
+        post_model_free = max_post_model_free
+        model_memory = init_free_memory - post_model_free
+        state_per_slot = LinearStatePool.bytes_per_slot(
+            config.model_config, self.dtype, config.tp_info.size
+        )
+        if state_per_slot > 0:
+            # Leave roughly half of the post-model memory for KV cache and
+            # activations.  This is important for GDN models: a single float32
+            # recurrent state can be > 100 MiB at TP=1.
+            state_budget = max(0, int(min_post_model_free * 0.5))
+            max_state_slots = max(1, state_budget // state_per_slot)
+            if config.max_running_req > max_state_slots:
+                object.__setattr__(config, "max_running_req", max_state_slots)
+                logger.warning_rank0(
+                    f"Cap max_running_req to {max_state_slots} due to linear state memory"
+                )
+        state_bytes = state_per_slot * (config.max_running_req + 1)
+        if state_per_slot > 0:
+            logger.info_rank0(
+                f"Linear state: {state_per_slot / (1024**2):.2f} MiB/slot, "
+                f"{state_bytes / (1024**3):.2f} GiB for "
+                f"{config.max_running_req + 1} slots"
+            )
+
+        self.num_pages = self._determine_num_pages(
+            init_free_memory, config, model_memory=model_memory, extra_reserved=state_bytes
+        )
         num_tokens = self.num_pages * config.page_size
+
+        self.linear_state: LinearStatePool | None = None
+        if state_per_slot > 0:
+            self.linear_state = LinearStatePool.from_model_config(
+                config.model_config,
+                num_slots=config.max_running_req + 1,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.ctx.linear_state = self.linear_state
+
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
@@ -107,6 +152,7 @@ class Engine:
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
+            max_batch_size=config.max_running_req,
         )
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
@@ -145,20 +191,36 @@ class Engine:
         else:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
-    def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        new_free_memory = self._sync_get_memory()[1]
+    def _determine_num_pages(
+        self,
+        old_free_memory: int,
+        config: EngineConfig,
+        model_memory: int | None = None,
+        extra_reserved: int = 0,
+    ) -> int:
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
             * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * config.model_config.num_layers
+            * config.model_config.num_kv_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
-            model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            if model_memory is None:
+                new_free_memory = self._sync_get_memory()[1]
+                model_memory = old_free_memory - new_free_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory - extra_reserved
+            )
+            if available_memory <= 0:
+                raise RuntimeError(
+                    "Not enough memory for KV cache: "
+                    f"model_memory={mem_GB(model_memory)}, "
+                    f"linear_state={mem_GB(extra_reserved)}, "
+                    f"memory_ratio={config.memory_ratio}"
+                )
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
@@ -220,7 +282,14 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     if config.attention_backend == "auto":
-        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        if is_sm120_supported():
+            backend = "fi"
+        elif is_sm100_supported():
+            backend = "trtllm"
+        elif is_sm90_supported():
+            backend = "fa,fi"
+        else:
+            backend = "fi"
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
 

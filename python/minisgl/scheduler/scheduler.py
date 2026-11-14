@@ -13,7 +13,7 @@ from minisgl.message import (
     ExitMsg,
     UserMsg,
 )
-from minisgl.utils import init_logger, load_tokenizer
+from minisgl.utils import init_logger, load_eos_token_ids, load_tokenizer
 
 from .cache import CacheManager
 from .config import SchedulerConfig
@@ -55,9 +55,18 @@ class Scheduler(SchedulerIOMixin):
         torch.cuda.set_stream(self.stream)
 
         # initialize other managers
-        self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        cache_type = config.cache_type
+        if config.model_config.is_hybrid and cache_type != "naive":
+            logger.warning_rank0(
+                "Hybrid linear-attention models do not support radix prefix cache yet; "
+                "falling back to naive cache."
+            )
+            cache_type = "naive"
+        self.table_manager = TableManager(
+            config.max_running_req, self.engine.page_table, self.engine.linear_state
+        )
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -68,6 +77,7 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
+        self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
@@ -152,7 +162,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
-                    finished |= next_token == self.eos_token_id
+                    finished |= next_token in self.eos_token_ids
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
@@ -205,6 +215,9 @@ class Scheduler(SchedulerIOMixin):
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
+        batch.state_indices = _make_state_indices(batch, self.device)
+        batch.linear_cu_seqlens = _make_linear_cu_seqlens(batch, self.device)
+        batch.has_initial_state = _make_has_initial_state(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
@@ -231,6 +244,23 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _make_state_indices(batch: Batch, device: torch.device) -> torch.Tensor:
+    values = [req.table_idx for req in batch.padded_reqs]
+    return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+
+
+def _make_linear_cu_seqlens(batch: Batch, device: torch.device) -> torch.Tensor:
+    values = [0]
+    for req in batch.padded_reqs:
+        values.append(values[-1] + req.extend_len)
+    return torch.tensor(values, dtype=torch.int32, pin_memory=True).to(device, non_blocking=True)
+
+
+def _make_has_initial_state(batch: Batch, device: torch.device) -> torch.Tensor:
+    values = [req.cached_len > 0 for req in batch.padded_reqs]
+    return torch.tensor(values, dtype=torch.bool, pin_memory=True).to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

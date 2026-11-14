@@ -18,7 +18,13 @@ from minisgl.message import (
     UserMsg,
     UserReply,
 )
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
+from minisgl.utils import (
+    ZmqPullQueue,
+    ZmqPushQueue,
+    init_logger,
+    load_eos_token_ids,
+    load_tokenizer,
+)
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
@@ -51,7 +57,7 @@ def tokenize_worker(
     from .tokenize import TokenizeManager
 
     tokenize_manager = TokenizeManager(tokenizer)
-    detokenize_manager = DetokenizeManager(tokenizer)
+    detokenize_manager = DetokenizeManager(tokenizer, load_eos_token_ids(tokenizer_path, tokenizer))
 
     if ack_queue is not None:
         ack_queue.put(f"Tokenize server {tokenizer_id} is ready")

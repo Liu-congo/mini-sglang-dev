@@ -15,6 +15,7 @@ from .base import (
     MatchResult,
     SizeInfo,
 )
+from .linear_state import LinearStatePool
 
 
 class CacheManagerCreator(Protocol):
@@ -37,7 +38,7 @@ def create_kvcache_pool(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
         page_size=page_size,
-        num_layers=model_config.num_layers,
+        num_layers=model_config.num_kv_layers,
         head_dim=model_config.head_dim,
         device=device,
         dtype=dtype,
@@ -67,6 +68,7 @@ __all__ = [
     "create_prefix_cache",
     "BaseKVCachePool",
     "BaseCacheHandle",
+    "LinearStatePool",
     "BasePrefixCache",
     "SizeInfo",
     "MatchResult",

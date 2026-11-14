@@ -25,6 +25,16 @@ Our framework currently supports the following dense model architectures:
 - [`Llama-3`](https://huggingface.co/collections/meta-llama/llama-31) series
 - [`Qwen-3`](https://huggingface.co/collections/Qwen/qwen3) series (including MoE)
 - [`Qwen-2.5`](https://huggingface.co/collections/Qwen/qwen25) series
+- [`Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) text model (hybrid Gated DeltaNet + full attention; vision/MTP weights are not loaded)
+
+### Qwen3.8-27B notes
+
+- Text-only: image/video inputs and the vision tower are not supported yet.
+- The model has 48 Gated DeltaNet layers and 16 full-attention layers. Only the full-attention layers use the paged KV cache; the other layers use a per-request recurrent/conv state pool.
+- Radix prefix cache is not available for this hybrid architecture yet. `--cache radix` is automatically downgraded to `naive`.
+- The 27B weights require roughly 51 GiB in bf16; at TP=1 each request's linear-attention state is about 147 MiB. Mini-SGLang automatically caps `--max-running-requests` so the state pool fits in GPU memory.
+- On Blackwell / SM120, `auto` selects the FlashInfer attention backend (`fi`).
+- See [Qwen3.8-27B usage notes](./qwen3_5.md) for launch examples and memory details.
 
 ## Chunked Prefill
 

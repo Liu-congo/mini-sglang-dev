@@ -22,14 +22,18 @@ class GraphCaptureBuffer:
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
+    state_indices: torch.Tensor
     logits: torch.Tensor
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls, bs: int, vocab_size: int, device: torch.device, dummy_state_idx: int
+    ) -> GraphCaptureBuffer:
         return GraphCaptureBuffer(
             input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
             out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
+            state_indices=torch.full((bs,), dummy_state_idx, dtype=torch.int32, device=device),
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
         )
 
@@ -38,33 +42,39 @@ class GraphCaptureBuffer:
         batch.input_ids = self.input_ids[_slice]
         batch.out_loc = self.out_loc[_slice]
         batch.positions = self.positions[_slice]
+        batch.state_indices = self.state_indices[_slice]
 
     def copy_from(self, batch: Batch) -> None:
         _slice = slice(batch.padded_size)
         self.input_ids[_slice] = batch.input_ids
         self.out_loc[_slice] = batch.out_loc
         self.positions[_slice] = batch.positions
+        self.state_indices[_slice] = batch.state_indices
 
 
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
     free_memory: int,
+    max_batch_size: int | None = None,
 ) -> List[int]:
-    if cuda_graph_bs is not None:
-        return cuda_graph_bs
+    if cuda_graph_bs is None:
+        free_memory_gb = free_memory / (1 << 30)
+        if cuda_graph_max_bs is None:
+            if free_memory_gb > 80:  # H200
+                cuda_graph_max_bs = 256
+            else:
+                cuda_graph_max_bs = 160
 
-    free_memory_gb = free_memory / (1 << 30)
-    if cuda_graph_max_bs is None:
-        if free_memory_gb > 80:  # H200
-            cuda_graph_max_bs = 256
-        else:
-            cuda_graph_max_bs = 160
+        if cuda_graph_max_bs < 1:
+            return []
+        result = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    else:
+        result = list(cuda_graph_bs)
 
-    if cuda_graph_max_bs < 1:
-        return []
-
-    return [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
+    if max_batch_size is not None:
+        result = [bs for bs in result if 1 <= bs <= max_batch_size]
+    return sorted(set(result))
 
 
 def mem_GB(size: int) -> str:
@@ -88,11 +98,13 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
+        max_batch_size: int | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=cuda_graph_max_bs,
             free_memory=free_memory,
+            max_batch_size=max_batch_size,
         )
         self.attn_backend = attn_backend
         self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
@@ -117,7 +129,12 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
+        self.buffer = GraphCaptureBuffer.init(
+            self.max_graph_bs,
+            vocab_size,
+            self.device,
+            dummy_state_idx=self.dummy_req.table_idx,
+        )
 
         pbar = tqdm(
             sorted(self.graph_bs_list, reverse=True),
