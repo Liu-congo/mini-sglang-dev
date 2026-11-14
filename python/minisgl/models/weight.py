@@ -52,6 +52,67 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
         return value
 
 
+def _shard_qwen3_5_tensor(key: str, value: torch.Tensor, r: int, n: int, config) -> torch.Tensor:
+    """Qwen3.5-specific sharding for GDN projections and the gated q_proj."""
+    if key.endswith(("linear_attn.in_proj_qkv.weight", "linear_attn.conv1d.weight")):
+        key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+        q = value[:key_dim].chunk(n, dim=0)[r]
+        k = value[key_dim : 2 * key_dim].chunk(n, dim=0)[r]
+        v = value[2 * key_dim :].chunk(n, dim=0)[r]
+        return torch.cat([q, k, v], dim=0).clone()
+
+    if key.endswith(
+        (
+            "linear_attn.in_proj_z.weight",
+            "linear_attn.in_proj_a.weight",
+            "linear_attn.in_proj_b.weight",
+        )
+    ):
+        return value.chunk(n, dim=0)[r].clone()
+
+    if key.endswith(("linear_attn.A_log", "linear_attn.dt_bias")):
+        return value.chunk(n, dim=0)[r].clone()
+
+    if key.endswith("linear_attn.out_proj.weight"):
+        return value.chunk(n, dim=1)[r].clone()
+
+    return _shard_tensor(key, value, r, n, config.num_kv_heads)
+
+
+def _normalize_key(name: str) -> str | None:
+    """Strip multimodal wrappers and drop weights that are out of scope."""
+    if name.startswith(
+        (
+            "model.visual.",
+            "visual.",
+            "mtp.",
+            "vision_tower.",
+            "multi_modal_projector.",
+        )
+    ):
+        return None
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model.") :]
+    if name.startswith("language_model."):
+        return name[len("language_model.") :]
+    return name
+
+
+def _needs_add_one(key: str) -> bool:
+    # Qwen3.5 (like Qwen3-Next) stores these RMSNorm weights as zero-centered
+    # values and computes (1 + weight) at runtime.  Convert once at load time
+    # so the existing FlashInfer RMSNorm kernels remain usable.
+    if "linear_attn.norm" in key:
+        return False
+    return (
+        key.endswith("input_layernorm.weight")
+        or key.endswith("post_attention_layernorm.weight")
+        or key.endswith("self_attn.q_norm.weight")
+        or key.endswith("self_attn.k_norm.weight")
+        or key == "model.norm.weight"
+    )
+
+
 def _get_merge_info(key: str):
     """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
@@ -82,22 +143,45 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = glob.glob(f"{model_folder}/*.safetensors")
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
+    is_qwen3_5 = config.model_type == "qwen3_5_text" or any(
+        arch.startswith("Qwen3_5") for arch in config.architectures
+    )
 
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
-            for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
-                if name.startswith(("vision_tower.", "multi_modal_projector.")):
+            for raw_name in f.keys():
+                name = _normalize_key(raw_name)
+                if name is None:
                     continue
-                raw = f.get_tensor(name)
-                name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                raw = f.get_tensor(raw_name)
+                if is_qwen3_5:
+                    tensor = _shard_qwen3_5_tensor(name, raw, tp_info.rank, tp_info.size, config)
+                else:
+                    tensor = _shard_tensor(
+                        name, raw, tp_info.rank, tp_info.size, config.num_kv_heads
+                    )
                 del raw
 
-                if (info := _get_merge_info(name)) is None:
+                if is_qwen3_5 and _needs_add_one(name):
+                    tensor = (tensor.float() + 1.0).to(tensor.dtype)
+
+                if is_qwen3_5 and name.endswith("linear_attn.conv1d.weight"):
+                    # The runtime Conv1D parameter is a bare tensor named
+                    # ``linear_attn.conv1d``; keep BaseOP.state_dict keys aligned.
+                    name = name.removesuffix(".weight")
+
+                info = _get_merge_info(name)
+                if is_qwen3_5 and any(
+                    suffix in name for suffix in (".q_proj", ".k_proj", ".v_proj")
+                ):
+                    # Qwen3.5 full attention keeps q/k/v separate because
+                    # q_proj also contains the output gate.
+                    info = None
+
+                if info is None:
                     out = (name, tensor)
                 else:
                     merged_key, slot, all_slots = info
