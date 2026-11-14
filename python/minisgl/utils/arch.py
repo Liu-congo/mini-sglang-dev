@@ -27,3 +27,7 @@ def is_sm90_supported() -> bool:
 
 def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
+
+
+def is_sm120_supported() -> bool:
+    return is_arch_supported(12, 0)

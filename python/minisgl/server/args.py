@@ -249,9 +249,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     del kwargs["model_source"]
 
     if (dtype_str := kwargs["dtype"]) == "auto":
-        from minisgl.utils import cached_load_hf_config
+        from minisgl.utils import cached_load_hf_config, get_hf_dtype
 
-        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+        dtype_str = get_hf_dtype(cached_load_hf_config(kwargs["model_path"])) or "bfloat16"
 
     DTYPE_MAP = {
         "float16": torch.float16,
