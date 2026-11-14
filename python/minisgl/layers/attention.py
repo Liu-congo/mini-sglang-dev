@@ -25,9 +25,11 @@ class AttentionLayer(StateLessOP):
         rotary_config: RotaryConfig,
         q_norm: RMSNorm | None = None,
         k_norm: RMSNorm | None = None,
+        kv_cache_id: int | None = None,
     ):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
+        self.kv_cache_id = layer_id if kv_cache_id is None else kv_cache_id
         self.head_dim = head_dim
         tp_size = get_tp_info().size
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
@@ -53,5 +55,5 @@ class AttentionLayer(StateLessOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        o = ctx.attn_backend.forward(q, k, v, self.kv_cache_id, ctx.batch)
         return o.view(-1, self.qo_attn_dim)

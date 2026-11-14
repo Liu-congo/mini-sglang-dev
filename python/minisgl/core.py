@@ -8,7 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
-    from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
+    from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool, LinearStatePool
     from minisgl.moe import BaseMoeBackend
 
 
@@ -77,6 +77,9 @@ class Batch:
     positions: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)
     padded_reqs: List[Req] = field(init=False)
+    state_indices: torch.Tensor = field(init=False)
+    linear_cu_seqlens: torch.Tensor = field(init=False)
+    has_initial_state: torch.Tensor = field(init=False)
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
 
@@ -105,6 +108,7 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    linear_state: "LinearStatePool | None" = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property
