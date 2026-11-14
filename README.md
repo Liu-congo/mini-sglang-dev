@@ -124,7 +124,27 @@ python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 3000
 
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
 
-### 4. Interactive Shell
+### 4. Qwen3.8-27B (Qwen3.5 hybrid)
+
+Qwen3.8-27B is supported as a text-only hybrid model (48 Gated DeltaNet layers +
+16 full-attention layers).  Its vision tower and MTP weights are skipped.  Radix
+prefix cache is not available for this hybrid architecture yet; use the naive
+cache.  On Blackwell/SM120, `auto` selects FlashInfer.
+
+```bash
+python -m minisgl \
+  --model /path/to/Qwen3.8-27B \
+  --tp 1 \
+  --attn fi \
+  --cache naive \
+  --max-running-requests 32 \
+  --cuda-graph-max-bs 8
+```
+
+The engine automatically caps `max_running_req` based on the linear-attention
+state pool memory.  See [docs/qwen3_5.md](./docs/qwen3_5.md) for details.
+
+### 5. Interactive Shell
 
 Chat with your model directly in the terminal by adding the `--shell` flag.
 
